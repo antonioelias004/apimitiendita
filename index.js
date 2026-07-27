@@ -788,7 +788,7 @@ app.delete("/proveedores/:id", async (req, res) => {
         precio_venta:{type:Number,required:true,min:0},
         stock:{type:Number,required:true,min:0,default:0},
         fecha_caducidad:{type:Date,required:false},
-        proveedor_id:{type:mongoose.Schema.Types.ObjectId,ref:'Proveedores',required:true}
+        proveedor_id:{type:mongoose.Schema.Types.ObjectId,ref:'Proveedor',required:true}
     },{
         timestamps: true
     });
