@@ -973,6 +973,231 @@ app.delete("/productos/:id", async (req, res) => {
 ///***********************ESQUEMA DE  VENTAS*************************
 
 
+// REGISTRAR UNA VENTA
+app.post("/ventas", async (req, res) => {
+    try {
+
+        const { empleado_id, cliente_id, metodo_pago, items } = req.body;
+
+        if (
+            !empleado_id ||
+            !cliente_id ||
+            !metodo_pago ||
+            !Array.isArray(items) ||
+            items.length === 0
+        ) {
+            return res.status(400).json({
+                mensaje: "Faltan datos de la venta"
+            });
+        }
+
+        const empleado = await Empleados.findById(empleado_id);
+        if (!empleado) {
+            return res.status(404).json({ mensaje: "Empleado no encontrado" });
+        }
+
+        const cliente = await Cliente.findById(cliente_id);
+        if (!cliente) {
+            return res.status(404).json({ mensaje: "Cliente no encontrado" });
+        }
+
+        const itemsProcesados = [];
+        let total = 0;
+
+        for (const it of items) {
+
+            if (!it.producto_id || !Number.isInteger(it.cantidad) || it.cantidad < 1) {
+                return res.status(400).json({
+                    mensaje: "Cada item requiere producto_id y cantidad mayor a 0"
+                });
+            }
+
+            const producto = await Producto.findById(it.producto_id);
+            if (!producto) {
+                return res.status(404).json({
+                    mensaje: "Producto no encontrado: " + it.producto_id
+                });
+            }
+
+            if (producto.stock < it.cantidad) {
+                return res.status(409).json({
+                    mensaje: "Stock insuficiente de " + producto.nombre +
+                             " (disponible: " + producto.stock + ")"
+                });
+            }
+
+            const subtotal = producto.precio_venta * it.cantidad;
+            total += subtotal;
+
+            itemsProcesados.push({
+                producto_id: producto._id,
+                nombre: producto.nombre,
+                cantidad: it.cantidad,
+                precio: producto.precio_venta,
+                subtotal: subtotal
+            });
+        }
+
+        // Descontar stock y revertir si algo falla
+        const aplicados = [];
+        for (const it of itemsProcesados) {
+
+            const r = await Producto.updateOne(
+                { _id: it.producto_id, stock: { $gte: it.cantidad } },
+                { $inc: { stock: -it.cantidad } }
+            );
+
+            if (r.matchedCount === 0) {
+                for (const a of aplicados) {
+                    await Producto.updateOne(
+                        { _id: a.producto_id },
+                        { $inc: { stock: a.cantidad } }
+                    );
+                }
+                return res.status(409).json({
+                    mensaje: "No se pudo descontar el stock de " + it.nombre
+                });
+            }
+
+            aplicados.push(it);
+        }
+
+        // Folio consecutivo V-0001
+        const ultima = await Venta.findOne().sort({ folio: -1 }).lean();
+        let n = 1;
+        if (ultima && ultima.folio) {
+            const num = parseInt(ultima.folio.replace(/\D/g, ""), 10);
+            if (!isNaN(num)) n = num + 1;
+        }
+        const folio = "V-" + String(n).padStart(4, "0");
+
+        const nuevaVenta = new Venta({
+            folio,
+            fecha: new Date(),
+            empleado_id,
+            cliente_id,
+            cliente_nombre: cliente.nombre,
+            items: itemsProcesados,
+            total: Math.round(total * 100) / 100,
+            metodo_pago,
+            estatus: "completada"
+        });
+
+        let ventaGuardada;
+        try {
+            ventaGuardada = await nuevaVenta.save();
+        } catch (e) {
+            for (const a of aplicados) {
+                await Producto.updateOne(
+                    { _id: a.producto_id },
+                    { $inc: { stock: a.cantidad } }
+                );
+            }
+            throw e;
+        }
+
+        res.status(201).json({
+            mensaje: "Venta registrada correctamente",
+            venta: ventaGuardada
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            mensaje: "Error al registrar la venta",
+            error: error.message
+        });
+    }
+});
+
+
+// ACTUALIZAR UNA VENTA
+app.put("/ventas/:id", async (req, res) => {
+    try {
+
+        const { cliente_id, metodo_pago, estatus } = req.body;
+
+        const venta = await Venta.findById(req.params.id);
+        if (!venta) {
+            return res.status(404).json({ mensaje: "Venta no encontrada" });
+        }
+
+        // Si se cancela una venta completada, devolver el stock
+        if (estatus === "cancelada" && venta.estatus === "completada") {
+            for (const it of venta.items) {
+                await Producto.updateOne(
+                    { _id: it.producto_id },
+                    { $inc: { stock: it.cantidad } }
+                );
+            }
+        }
+
+        if (metodo_pago) {
+            venta.metodo_pago = metodo_pago;
+        }
+
+        if (estatus) {
+            venta.estatus = estatus;
+        }
+
+        if (cliente_id) {
+            const cliente = await Cliente.findById(cliente_id);
+            if (!cliente) {
+                return res.status(404).json({ mensaje: "Cliente no encontrado" });
+            }
+            venta.cliente_id = cliente_id;
+            venta.cliente_nombre = cliente.nombre;
+        }
+
+        const ventaActualizada = await venta.save();
+
+        res.json({
+            mensaje: "Venta actualizada correctamente",
+            venta: ventaActualizada
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            mensaje: "Error al actualizar la venta",
+            error: error.message
+        });
+    }
+});
+
+
+// ELIMINAR UNA VENTA
+app.delete("/ventas/:id", async (req, res) => {
+    try {
+
+        const venta = await Venta.findById(req.params.id);
+        if (!venta) {
+            return res.status(404).json({ mensaje: "Venta no encontrada" });
+        }
+
+        // Devolver stock si la venta seguia completada
+        if (venta.estatus === "completada") {
+            for (const it of venta.items) {
+                await Producto.updateOne(
+                    { _id: it.producto_id },
+                    { $inc: { stock: it.cantidad } }
+                );
+            }
+        }
+
+        await Venta.findByIdAndDelete(req.params.id);
+
+        res.json({
+            mensaje: "Venta eliminada correctamente",
+            venta: venta
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            mensaje: "Error al eliminar la venta",
+            error: error.message
+        });
+    }
+});
+
 
 
     app.get("/", (req, res) => {
