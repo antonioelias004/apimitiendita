@@ -1,14 +1,67 @@
+require("dotenv").config();
+
 const express = require("express");
 const morgan = require("morgan");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+const SALT_ROUNDS = 10;
+
+// Clave para firmar los tokens. Siempre viene del entorno: si no esta
+// definida no se arranca, para no firmar con un secreto conocido.
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    console.error("Falta la variable de entorno JWT_SECRET (revisa tu archivo .env)");
+    process.exit(1);
+}
+const JWT_EXPIRACION = "8h"; // dura un turno de trabajo
 
 app.use(cors());
 app.use(express.json());
 app.use(morgan("dev"));
+
+// ==========================================================
+// MIDDLEWARE DE AUTENTICACION
+// Protege todas las rutas salvo las publicas (/ y POST /login).
+// El cliente debe mandar la cabecera: Authorization: Bearer <token>
+// ==========================================================
+function verificarToken(req, res, next) {
+
+    // Dejar pasar preflight de CORS
+    if (req.method === "OPTIONS") {
+        return next();
+    }
+
+    // Rutas publicas: raiz y login
+    if (req.path === "/" || (req.path === "/login" && req.method === "POST")) {
+        return next();
+    }
+
+    const cabecera = req.headers.authorization || "";
+    const token = cabecera.startsWith("Bearer ") ? cabecera.slice(7) : null;
+
+    if (!token) {
+        return res.status(401).json({
+            mensaje: "Acceso denegado: falta el token de autenticacion"
+        });
+    }
+
+    try {
+        const payload = jwt.verify(token, JWT_SECRET);
+        req.usuario = payload; // { id, usuario, puesto } disponible en las rutas
+        next();
+    } catch (error) {
+        return res.status(401).json({
+            mensaje: "Token invalido o expirado, inicia sesion nuevamente"
+        });
+    }
+}
+
+app.use(verificarToken);
 
 //// ***********************ESQUEMA DE EMPLEADOS**********************
 
@@ -86,12 +139,76 @@ const Empleados = mongoose.model(
     "empleados"
 );
 
+// LOGIN DE EMPLEADOS
+app.post("/login", async (req, res) => {
+    try {
+
+        const { usuario, password } = req.body;
+
+        if (!usuario || !password) {
+            return res.status(400).json({
+                mensaje: "Usuario y contrasena son obligatorios"
+            });
+        }
+
+        // Buscar por usuario. Se incluye el password para poder compararlo.
+        const empleado = await Empleados.findOne({ usuario });
+
+        // Mismo mensaje para usuario inexistente o password incorrecta,
+        // para no revelar cual de los dos fallo.
+        const credencialesInvalidas = () =>
+            res.status(401).json({ mensaje: "Usuario o contrasena incorrectos" });
+
+        if (!empleado) {
+            return credencialesInvalidas();
+        }
+
+        const coincide = await bcrypt.compare(password, empleado.password);
+        if (!coincide) {
+            return credencialesInvalidas();
+        }
+
+        if (empleado.activo === false) {
+            return res.status(403).json({
+                mensaje: "La cuenta esta desactivada, contacta al administrador"
+            });
+        }
+
+        // Login correcto: generar token de sesion
+        const token = jwt.sign(
+            {
+                id: empleado._id,
+                usuario: empleado.usuario,
+                puesto: empleado.puesto
+            },
+            JWT_SECRET,
+            { expiresIn: JWT_EXPIRACION }
+        );
+
+        // Devolver datos del empleado SIN la contrasena
+        const datos = empleado.toObject();
+        delete datos.password;
+
+        res.json({
+            mensaje: "Inicio de sesion correcto",
+            token: token,
+            empleado: datos
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            mensaje: "Error al iniciar sesion",
+            error: error.message
+        });
+    }
+});
+
 // OBTENER TODOS LOS EMPLEADOS
 
 app.get("/empleados", async (req, res) => {
     try {
 
-        const empleados = await Empleados.find();
+        const empleados = await Empleados.find().select("-password");
 
         res.json(empleados);
 
@@ -109,7 +226,7 @@ app.get("/empleados", async (req, res) => {
 app.get("/empleados/:id", async (req, res) => {
     try {
 
-        const empleado = await Empleados.findById(req.params.id);
+        const empleado = await Empleados.findById(req.params.id).select("-password");
 
         if (!empleado) {
             return res.status(404).json({
@@ -169,6 +286,11 @@ app.post("/empleados", async (req, res) => {
         }
 
 
+        // Hashear la contrasena antes de guardar (nunca en texto plano)
+
+        const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+
+
         // Crear empleado
 
         const nuevoEmpleado = new Empleados({
@@ -179,7 +301,7 @@ app.post("/empleados", async (req, res) => {
             puesto,
             turno,
             usuario,
-            password,
+            password: passwordHash,
             salario,
             fecha_ingreso,
             activo
@@ -191,12 +313,16 @@ app.post("/empleados", async (req, res) => {
 
         const empleadoGuardado = await nuevoEmpleado.save();
 
+        // No devolver la contrasena en la respuesta
+        const empleadoSinPassword = empleadoGuardado.toObject();
+        delete empleadoSinPassword.password;
+
 
         res.status(201).json({
 
             mensaje: "Empleado registrado correctamente",
 
-            empleado: empleadoGuardado
+            empleado: empleadoSinPassword
 
         });
 
@@ -232,6 +358,7 @@ app.put("/empleados/:id", async (req, res) => {
         } = req.body;
 
 
+        // password es OPCIONAL al editar: si no llega, se conserva la actual
         if (
             !nombre ||
             !email ||
@@ -239,7 +366,6 @@ app.put("/empleados/:id", async (req, res) => {
             !puesto ||
             !turno ||
             !usuario ||
-            !password ||
             salario === undefined ||
             !fecha_ingreso ||
             activo === undefined
@@ -252,27 +378,35 @@ app.put("/empleados/:id", async (req, res) => {
         }
 
 
+        const datosActualizados = {
+            nombre,
+            email,
+            telefono,
+            puesto,
+            turno,
+            usuario,
+            salario,
+            fecha_ingreso,
+            activo
+        };
+
+        // Solo re-hashear si mandan una contrasena nueva
+        if (password) {
+            datosActualizados.password = await bcrypt.hash(password, SALT_ROUNDS);
+        }
+
+
         const empleadoActualizado =
             await Empleados.findByIdAndUpdate(
 
                 req.params.id,
 
-                {
-                    nombre,
-                    email,
-                    telefono,
-                    puesto,
-                    turno,
-                    usuario,
-                    password,
-                    salario,
-                    fecha_ingreso,
-                    activo
-                },
+                datosActualizados,
 
                 {
                     new: true,
-                    runValidators: true
+                    runValidators: true,
+                    select: "-password"
                 }
 
             );
@@ -355,32 +489,44 @@ const clienteSchema = new mongoose.Schema({
 
     nombre: {
         type: String,
-        required: true
+        required: true,
+        trim: true
+    },
+
+    email: {
+        type: String,
+        required: true,
+        trim: true,
+        match: [/^.+@.+\..+$/, "El correo no tiene un formato valido"]
     },
 
     telefono: {
         type: String,
-        required: true
-    },
-
-    correo: {
-        type: String,
-        required: true
+        required: true,
+        trim: true
     },
 
     direccion: {
         type: String,
-        required: true
+        required: false,
+        trim: true
     },
 
-    fechaRegistro: {
+    fecha_registro: {
         type: Date,
+        required: true,
         default: Date.now
+    },
+
+    activo: {
+        type: Boolean,
+        required: true,
+        default: true
     }
 
 });
 
-const Cliente = mongoose.model("Cliente", clienteSchema);
+const Cliente = mongoose.model("Cliente", clienteSchema, "clientes");
 
 
 //*********************** RUTAS DE CLIENTES ***********************
@@ -439,13 +585,29 @@ app.post("/clientes", async (req, res) => {
 
     try {
 
+        const {
+            nombre,
+            email,
+            telefono,
+            direccion,
+            fecha_registro,
+            activo
+        } = req.body;
+
+        if (!nombre || !email || !telefono) {
+            return res.status(400).json({
+                mensaje: "Faltan datos del cliente (nombre, email y telefono son obligatorios)"
+            });
+        }
+
         const nuevoCliente = new Cliente({
 
-            nombre: req.body.nombre,
-            telefono: req.body.telefono,
-            correo: req.body.correo,
-            direccion: req.body.direccion,
-            fechaRegistro: req.body.fechaRegistro
+            nombre,
+            email,
+            telefono,
+            direccion,
+            fecha_registro: fecha_registro || new Date(),
+            activo: activo === undefined ? true : activo
 
         });
 
@@ -787,7 +949,9 @@ app.delete("/proveedores/:id", async (req, res) => {
         precio_compra:{type:Number,required:true,min:0},
         precio_venta:{type:Number,required:true,min:0},
         stock:{type:Number,required:true,min:0,default:0},
+        unidad:{type:String,required:true,enum:{values:["pieza","kg"],message:"La unidad debe ser 'pieza' o 'kg'"},default:"pieza"},
         fecha_caducidad:{type:Date,required:false},
+        imagen:{type:String,required:false,trim:true,match:[/^https?:\/\//,"La imagen debe ser una URL que empiece con http:// o https://"]},
         proveedor_id:{type:mongoose.Schema.Types.ObjectId,ref:'Proveedor',required:true}
     },{
         timestamps: true
@@ -839,7 +1003,9 @@ app.post("/productos", async (req, res) => {
             precio_compra,
             precio_venta,
             stock,
+            unidad,
             fecha_caducidad,
+            imagen,
             proveedor_id
         } = req.body;
 
@@ -857,14 +1023,16 @@ app.post("/productos", async (req, res) => {
         }
 
         const nuevoProducto = new Producto({
-            codigo_barras,
+            codigo_barras: codigo_barras && codigo_barras.trim() ? codigo_barras.trim() : undefined,
             nombre,
             descripcion,
             categoria,
             precio_compra,
             precio_venta,
             stock,
+            unidad: unidad || "pieza",
             fecha_caducidad,
+            imagen: imagen && imagen.trim() ? imagen.trim() : undefined,
             proveedor_id
         });
 
@@ -893,7 +1061,9 @@ app.put("/productos/:id", async (req, res) => {
             precio_compra,
             precio_venta,
             stock,
+            unidad,
             fecha_caducidad,
+            imagen,
             proveedor_id
         } = req.body;
 
@@ -913,14 +1083,16 @@ app.put("/productos/:id", async (req, res) => {
         const productoActualizado = await Producto.findByIdAndUpdate(
             req.params.id,
             {
-                codigo_barras,
+                codigo_barras: codigo_barras && codigo_barras.trim() ? codigo_barras.trim() : undefined,
                 nombre,
                 descripcion,
                 categoria,
                 precio_compra,
                 precio_venta,
                 stock,
+                unidad,
                 fecha_caducidad,
+                imagen: imagen && imagen.trim() ? imagen.trim() : undefined,
                 proveedor_id
             },
             {
@@ -972,6 +1144,143 @@ app.delete("/productos/:id", async (req, res) => {
 
 ///***********************ESQUEMA DE  VENTAS*************************
 
+// Subdocumento de cada renglon de la venta
+const itemSchema = new mongoose.Schema(
+    {
+        producto_id: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Producto",
+            required: true
+        },
+        nombre: {
+            type: String,
+            required: true,
+            trim: true
+        },
+        cantidad: {
+            type: Number,
+            required: true,
+            min: [0.001, "La cantidad debe ser mayor a 0"]
+        },
+        unidad: {
+            type: String,
+            required: true,
+            enum: ["pieza", "kg"],
+            default: "pieza"
+        },
+        precio: {
+            type: Number,
+            required: true,
+            min: 0
+        },
+        subtotal: {
+            type: Number,
+            required: true,
+            min: 0
+        }
+    },
+    { _id: false }
+);
+
+const ventaSchema = new mongoose.Schema(
+    {
+        folio: {
+            type: String,
+            required: true,
+            unique: true,
+            trim: true
+        },
+        fecha: {
+            type: Date,
+            required: true,
+            default: Date.now
+        },
+        empleado_id: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Empleados",
+            required: true
+        },
+        cliente_id: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Cliente",
+            required: true
+        },
+        cliente_nombre: {
+            type: String,
+            required: true,
+            trim: true
+        },
+        items: {
+            type: [itemSchema],
+            required: true
+        },
+        total: {
+            type: Number,
+            required: true,
+            min: 0
+        },
+        metodo_pago: {
+            type: String,
+            required: true,
+            enum: ["efectivo", "tarjeta", "transferencia"]
+        },
+        estatus: {
+            type: String,
+            required: true,
+            enum: ["completada", "cancelada"],
+            default: "completada"
+        }
+    },
+    {
+        timestamps: true
+    }
+);
+
+// MODELO
+const Venta = mongoose.model("Venta", ventaSchema, "ventas");
+
+
+// OBTENER TODAS LAS VENTAS
+app.get("/ventas", async (req, res) => {
+    try {
+
+        const ventas = await Venta.find()
+            .select("folio fecha cliente_nombre total metodo_pago estatus")
+            .sort({ fecha: -1 });
+
+        res.json(ventas);
+
+    } catch (error) {
+        res.status(500).json({
+            mensaje: "Error al obtener las ventas",
+            error: error.message
+        });
+    }
+});
+
+
+// OBTENER UNA VENTA POR ID
+app.get("/ventas/:id", async (req, res) => {
+    try {
+
+        const venta = await Venta.findById(req.params.id)
+            .populate("empleado_id", "nombre puesto")
+            .populate("cliente_id", "nombre email");
+
+        if (!venta) {
+            return res.status(404).json({ mensaje: "Venta no encontrada" });
+        }
+
+        res.json(venta);
+
+    } catch (error) {
+        res.status(500).json({
+            mensaje: "Error al obtener la venta",
+            error: error.message
+        });
+    }
+});
+
 
 // REGISTRAR UNA VENTA
 app.post("/ventas", async (req, res) => {
@@ -1006,7 +1315,8 @@ app.post("/ventas", async (req, res) => {
 
         for (const it of items) {
 
-            if (!it.producto_id || !Number.isInteger(it.cantidad) || it.cantidad < 1) {
+            if (!it.producto_id || typeof it.cantidad !== "number" ||
+                !isFinite(it.cantidad) || it.cantidad <= 0) {
                 return res.status(400).json({
                     mensaje: "Cada item requiere producto_id y cantidad mayor a 0"
                 });
@@ -1019,20 +1329,36 @@ app.post("/ventas", async (req, res) => {
                 });
             }
 
-            if (producto.stock < it.cantidad) {
-                return res.status(409).json({
-                    mensaje: "Stock insuficiente de " + producto.nombre +
-                             " (disponible: " + producto.stock + ")"
+            // La unidad del producto define si admite decimales
+            const porKilo = producto.unidad === "kg";
+
+            if (!porKilo && !Number.isInteger(it.cantidad)) {
+                return res.status(400).json({
+                    mensaje: producto.nombre + " se vende por pieza: la cantidad debe ser un numero entero"
                 });
             }
 
-            const subtotal = producto.precio_venta * it.cantidad;
+            // Al granel se le permiten hasta 3 decimales (gramos)
+            const cantidad = porKilo
+                ? Math.round(it.cantidad * 1000) / 1000
+                : it.cantidad;
+
+            if (producto.stock < cantidad) {
+                return res.status(409).json({
+                    mensaje: "Stock insuficiente de " + producto.nombre +
+                             " (disponible: " + producto.stock +
+                             (porKilo ? " kg)" : ")")
+                });
+            }
+
+            const subtotal = Math.round(producto.precio_venta * cantidad * 100) / 100;
             total += subtotal;
 
             itemsProcesados.push({
                 producto_id: producto._id,
                 nombre: producto.nombre,
-                cantidad: it.cantidad,
+                cantidad: cantidad,
+                unidad: producto.unidad || "pieza",
                 precio: producto.precio_venta,
                 subtotal: subtotal
             });
@@ -1205,9 +1531,15 @@ app.delete("/ventas/:id", async (req, res) => {
     });
 
 async function iniciarServidor() {
+       const MONGODB_URI = process.env.MONGODB_URI;
+       if (!MONGODB_URI) {
+           console.error("Falta la variable de entorno MONGODB_URI (revisa tu archivo .env)");
+           process.exit(1);
+       }
+
        try {
            await mongoose.connect(
-               "mongodb+srv://root:root@servidorprueba.6wjsj0y.mongodb.net/TiendaDB",
+               MONGODB_URI,
                {
                    serverSelectionTimeoutMS: 10000
                }
