@@ -1,2 +1,21 @@
+# Dependencias
 node_modules/
+
+# Variables de entorno (NUNCA subir)
 .env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+server.log
+npm-debug.log*
+
+# Vercel
+.vercel
+
+# Sistema operativo / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
