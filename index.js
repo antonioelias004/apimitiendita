@@ -1315,7 +1315,57 @@ app.delete("/ventas/:id", async (req, res) => {
     }
 });
 
+// ==========================================================
+//                   RUTA DE LOGIN
+// ==========================================================
+app.post("/login", async (req, res) => {
+    try {
+        const { usuario, password } = req.body;
 
+        // 1. Validar que vengan los datos
+        if (!usuario || !password) {
+            return res.status(400).json({
+                mensaje: "Debes ingresar un usuario y una contraseña"
+            });
+        }
+
+        // 2. Buscar al empleado en la base de datos por su usuario
+        const empleado = await Empleados.findOne({ usuario });
+
+        // 3. Verificar si existe y si la contraseña coincide
+        if (!empleado || empleado.password !== password) {
+            return res.status(401).json({
+                mensaje: "Usuario o contraseña incorrectos"
+            });
+        }
+
+        // 4. Verificar si el empleado está activo
+        if (!empleado.activo) {
+            return res.status(403).json({
+                mensaje: "Esta cuenta de empleado se encuentra desactivada"
+            });
+        }
+
+        // 5. Responder con los datos del empleado y un token de sesión ficticio/simple
+        res.json({
+            mensaje: "Inicio de sesión exitoso",
+            token: "token_simulado_" + empleado._id,
+            empleado: {
+                id: empleado._id,
+                nombre: empleado.nombre,
+                usuario: empleado.usuario,
+                puesto: empleado.puesto,
+                email: empleado.email
+            }
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            mensaje: "Error interno en el servidor al intentar iniciar sesión",
+            error: error.message
+        });
+    }
+});
 
     app.get("/", (req, res) => {
     res.send("API del Proyecto NoSQL");
