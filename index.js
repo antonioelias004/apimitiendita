@@ -859,9 +859,13 @@ app.post("/productos", async (req, res) => {
                 mensaje: "Faltan datos obligatorios del producto"
             });
         }
+        // Convertir cadena vacía a null si no ingresaron código
+        const codigoFinal = (codigo_barras && codigo_barras.trim() !== "") 
+            ? codigo_barras.trim() 
+            : null;
 
         const nuevoProducto = new Producto({
-            codigo_barras,
+            codigo_barras: codigoFinal, 
             nombre,
             descripcion,
             categoria,
@@ -917,11 +921,13 @@ app.put("/productos/:id", async (req, res) => {
                 mensaje: "Faltan datos obligatorios del producto"
             });
         }
-
+            const codigoFinal = (codigo_barras && codigo_barras.trim() !== "") 
+            ? codigo_barras.trim() 
+            : null;
         const productoActualizado = await Producto.findByIdAndUpdate(
             req.params.id,
             {
-                codigo_barras,
+               codigo_barras: codigoFinal, 
                 nombre,
                 descripcion,
                 categoria,
