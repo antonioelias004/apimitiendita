@@ -784,6 +784,7 @@ app.delete("/proveedores/:id", async (req, res) => {
         nombre:{type:String,required:true,trim:true,maxlength:100},
         descripcion:{type:String,required:false,trim:true,maxlength:500},
         categoria:{type:String,required:true,trim:true},
+        unidad:{type:String,required:true,enum:['pieza','kg'],default:'pieza'},
         precio_compra:{type:Number,required:true,min:0},
         precio_venta:{type:Number,required:true,min:0},
         stock:{type:Number,required:true,min:0,default:0},
@@ -836,6 +837,7 @@ app.post("/productos", async (req, res) => {
             nombre,
             descripcion,
             categoria,
+            unidad,
             precio_compra,
             precio_venta,
             stock,
@@ -861,6 +863,7 @@ app.post("/productos", async (req, res) => {
             nombre,
             descripcion,
             categoria,
+            unidad,
             precio_compra,
             precio_venta,
             stock,
@@ -890,6 +893,7 @@ app.put("/productos/:id", async (req, res) => {
             nombre,
             descripcion,
             categoria,
+            unidad,
             precio_compra,
             precio_venta,
             stock,
@@ -917,6 +921,7 @@ app.put("/productos/:id", async (req, res) => {
                 nombre,
                 descripcion,
                 categoria,
+                unidad,
                 precio_compra,
                 precio_venta,
                 stock,
@@ -972,6 +977,110 @@ app.delete("/productos/:id", async (req, res) => {
 
 ///***********************ESQUEMA DE  VENTAS*************************
 
+const itemVentaSchema = new mongoose.Schema({
+    producto_id: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Producto",
+        required: true
+    },
+    nombre: { type: String, required: true, trim: true },
+    cantidad: { type: Number, required: true, min: 0.001 },
+    precio: { type: Number, required: true, min: 0 },
+    subtotal: { type: Number, required: true, min: 0 }
+}, { _id: false });
+
+const ventaSchema = new mongoose.Schema({
+    folio: { type: String, required: true, unique: true, trim: true },
+    fecha: { type: Date, default: Date.now },
+
+    empleado_id: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Empleados",
+        required: true
+    },
+
+    // El cliente es opcional: no toda venta tiene un cliente registrado
+    cliente_id: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Cliente",
+        required: false,
+        default: null
+    },
+    cliente_nombre: { type: String, trim: true, default: "Público general" },
+
+    items: {
+        type: [itemVentaSchema],
+        required: true,
+        validate: {
+            validator: (v) => Array.isArray(v) && v.length > 0,
+            message: "La venta debe tener al menos un producto"
+        }
+    },
+
+    total: { type: Number, required: true, min: 0 },
+
+    metodo_pago: {
+        type: String,
+        required: true,
+        enum: ["efectivo", "tarjeta", "transferencia"]
+    },
+
+    estatus: {
+        type: String,
+        required: true,
+        enum: ["completada", "cancelada"],
+        default: "completada"
+    }
+}, {
+    timestamps: true
+});
+
+const Venta = mongoose.model("Venta", ventaSchema, "ventas");
+
+
+// OBTENER TODAS LAS VENTAS (resumen para el historial)
+app.get("/ventas", async (req, res) => {
+    try {
+
+        const ventas = await Venta
+            .find()
+            .select("folio fecha cliente_nombre total metodo_pago estatus")
+            .sort({ fecha: -1 });
+
+        res.json(ventas);
+
+    } catch (error) {
+        res.status(500).json({
+            mensaje: "Error al obtener las ventas",
+            error: error.message
+        });
+    }
+});
+
+// OBTENER UNA VENTA POR ID (detalle completo)
+app.get("/ventas/:id", async (req, res) => {
+    try {
+
+        const venta = await Venta
+            .findById(req.params.id)
+            .populate("empleado_id", "-password")
+            .populate("cliente_id")
+            .populate("items.producto_id");
+
+        if (!venta) {
+            return res.status(404).json({ mensaje: "Venta no encontrada" });
+        }
+
+        res.json(venta);
+
+    } catch (error) {
+        res.status(500).json({
+            mensaje: "Error al obtener la venta",
+            error: error.message
+        });
+    }
+});
+
 
 // REGISTRAR UNA VENTA
 app.post("/ventas", async (req, res) => {
@@ -981,7 +1090,6 @@ app.post("/ventas", async (req, res) => {
 
         if (
             !empleado_id ||
-            !cliente_id ||
             !metodo_pago ||
             !Array.isArray(items) ||
             items.length === 0
@@ -996,9 +1104,13 @@ app.post("/ventas", async (req, res) => {
             return res.status(404).json({ mensaje: "Empleado no encontrado" });
         }
 
-        const cliente = await Cliente.findById(cliente_id);
-        if (!cliente) {
-            return res.status(404).json({ mensaje: "Cliente no encontrado" });
+        // El cliente es opcional
+        let cliente = null;
+        if (cliente_id) {
+            cliente = await Cliente.findById(cliente_id);
+            if (!cliente) {
+                return res.status(404).json({ mensaje: "Cliente no encontrado" });
+            }
         }
 
         const itemsProcesados = [];
@@ -1006,7 +1118,7 @@ app.post("/ventas", async (req, res) => {
 
         for (const it of items) {
 
-            if (!it.producto_id || !Number.isInteger(it.cantidad) || it.cantidad < 1) {
+            if (!it.producto_id || typeof it.cantidad !== "number" || it.cantidad <= 0) {
                 return res.status(400).json({
                     mensaje: "Cada item requiere producto_id y cantidad mayor a 0"
                 });
@@ -1075,8 +1187,8 @@ app.post("/ventas", async (req, res) => {
             folio,
             fecha: new Date(),
             empleado_id,
-            cliente_id,
-            cliente_nombre: cliente.nombre,
+            cliente_id: cliente_id || null,
+            cliente_nombre: cliente ? cliente.nombre : "Público general",
             items: itemsProcesados,
             total: Math.round(total * 100) / 100,
             metodo_pago,
