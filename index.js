@@ -2,7 +2,7 @@ const express = require("express");
 const morgan = require("morgan");
 const mongoose = require("mongoose");
 const cors = require("cors");
-
+const bcrypt = require("bcryptjs");
 const app = express();
 const PORT = 3000;
 
@@ -1316,37 +1316,47 @@ app.delete("/ventas/:id", async (req, res) => {
 });
 
 // ==========================================================
-//                   RUTA DE LOGIN
+//                   RUTA DE LOGIN (CON BCRYPT)
 // ==========================================================
 app.post("/login", async (req, res) => {
     try {
         const { usuario, password } = req.body;
 
-        // 1. Validar que vengan los datos
         if (!usuario || !password) {
             return res.status(400).json({
                 mensaje: "Debes ingresar un usuario y una contraseña"
             });
         }
 
-        // 2. Buscar al empleado en la base de datos por su usuario
-        const empleado = await Empleados.findOne({ usuario });
+        // 1. Buscar al empleado ignorando mayúsculas/minúsculas
+        const usuarioLimpio = usuario.trim();
+        const empleado = await Empleados.findOne({
+            usuario: { $regex: new RegExp("^" + usuarioLimpio + "$", "i") }
+        });
 
-        // 3. Verificar si existe y si la contraseña coincide
-        if (!empleado || empleado.password !== password) {
+        if (!empleado) {
             return res.status(401).json({
                 mensaje: "Usuario o contraseña incorrectos"
             });
         }
 
-        // 4. Verificar si el empleado está activo
+        // 2. Comparar la contraseña ingresada con el HASH encriptado de la base de datos
+        const esValida = await bcrypt.compare(password, empleado.password);
+
+        if (!esValida) {
+            return res.status(401).json({
+                mensaje: "Usuario o contraseña incorrectos"
+            });
+        }
+
+        // 3. Verificar si el empleado está activo
         if (!empleado.activo) {
             return res.status(403).json({
                 mensaje: "Esta cuenta de empleado se encuentra desactivada"
             });
         }
 
-        // 5. Responder con los datos del empleado y un token de sesión ficticio/simple
+        // 4. Login exitoso
         res.json({
             mensaje: "Inicio de sesión exitoso",
             token: "token_simulado_" + empleado._id,
